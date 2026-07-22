@@ -568,7 +568,7 @@ MonoBehaviour:
   maxRange: 2
   obstacleMask:
     serializedVersion: 2
-    m_Bits: 64
+    m_Bits: 320
   drawRays: 1
   drawFov: 1
 --- !u!1 &2935531821236154121
@@ -740,7 +740,7 @@ Transform:
   serializedVersion: 2
   m_LocalRotation: {x: -0, y: -0, z: 0.7071068, w: 0.7071068}
   m_LocalPosition: {x: -1.5, y: 0.5, z: 0}
-  m_LocalScale: {x: 1, y: 0, z: 3}
+  m_LocalScale: {x: 1, y: 0.02, z: 3}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 4935700584611180953}
@@ -821,7 +821,7 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 1, y: 0, z: 1}
+  m_Size: {x: 1, y: 1, z: 1}
   m_Center: {x: 0, y: 0, z: 0}
 --- !u!1 &3325553177404754730
 GameObject:
@@ -1636,7 +1636,7 @@ Transform:
   serializedVersion: 2
   m_LocalRotation: {x: 0.7071068, y: -0, z: -0, w: 0.7071068}
   m_LocalPosition: {x: 0, y: 0.5, z: 1.5}
-  m_LocalScale: {x: 3, y: 0, z: 1}
+  m_LocalScale: {x: 3, y: 0.02, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 4935700584611180953}
@@ -1717,7 +1717,7 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 1, y: 0, z: 1}
+  m_Size: {x: 1, y: 1, z: 1}
   m_Center: {x: 0, y: 0, z: 0}
 --- !u!1 &6704844757992194088
 GameObject:
@@ -2109,7 +2109,7 @@ Transform:
   serializedVersion: 2
   m_LocalRotation: {x: 0.7071068, y: -0, z: -0, w: 0.7071068}
   m_LocalPosition: {x: 0, y: 0.5, z: -1.5}
-  m_LocalScale: {x: 3, y: 0, z: 1}
+  m_LocalScale: {x: 3, y: 0.02, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 4935700584611180953}
@@ -2190,7 +2190,7 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 1, y: 0, z: 1}
+  m_Size: {x: 1, y: 1, z: 1}
   m_Center: {x: 0, y: 0, z: 0}
 --- !u!1 &7811402558463121745
 GameObject:
@@ -2274,7 +2274,7 @@ Transform:
   serializedVersion: 2
   m_LocalRotation: {x: -0, y: -0, z: 0.7071068, w: 0.7071068}
   m_LocalPosition: {x: 1.5, y: 0.5, z: 0}
-  m_LocalScale: {x: 1, y: 0, z: 3}
+  m_LocalScale: {x: 1, y: 0.02, z: 3}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 4935700584611180953}
@@ -2355,7 +2355,7 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 1, y: 0, z: 1}
+  m_Size: {x: 1, y: 1, z: 1}
   m_Center: {x: 0, y: 0, z: 0}
 --- !u!1 &9071272255541093062
 GameObject:
@@ -3122,7 +3122,7 @@ MonoBehaviour:
   gripperIRPoint: {fileID: 2719738228913740021}
   obstacleMask:
     serializedVersion: 2
-    m_Bits: 64
+    m_Bits: 320
   ballMask:
     serializedVersion: 2
     m_Bits: 128
