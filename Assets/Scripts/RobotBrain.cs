@@ -133,7 +133,9 @@ public class RobotBrain : Agent
     private Collider   ballCol;
     private Vector3    ballStartPosition; // стартовая точка мяча на арене
 
-    private float prevPotential;       // Ф(s) на предыдущем шаге (potential-based shaping)
+    private float prevPotential;       // Ф(s) на предыдущей policy decision boundary
+    private bool  hasDecisionPotential;
+    private DecisionRequester decisionRequester;
     private float prevGas, prevSteer, prevCam;  // предыдущие команды (для штрафа за резкость)
     private float camServoAngle;       // текущий угол сервопривода камеры, -max..+max
     private float episodeTimer;        // сколько секунд длится текущий эпизод
@@ -234,6 +236,21 @@ public class RobotBrain : Agent
             int obstacleLayer = LayerMask.NameToLayer("Obstacle");
             if (obstacleLayer >= 0) obstacleCollisionMask = 1 << obstacleLayer;
         }
+
+        decisionRequester = GetComponent<DecisionRequester>();
+        Debug.Assert(decisionRequester != null, "RobotBrain requires a DecisionRequester component.");
+
+        // Defensive unsubscribe keeps the subscription unique even if initialization is repeated.
+        Academy.Instance.AgentPreStep -= OnAcademyPreStep;
+        Academy.Instance.AgentPreStep += OnAcademyPreStep;
+    }
+
+    protected override void OnDisable()
+    {
+        if (Academy.IsInitialized)
+            Academy.Instance.AgentPreStep -= OnAcademyPreStep;
+
+        base.OnDisable();
     }
 
     // Рандомизация физики/сенсоров (масса, шум УЗ, задержки) — только на обучении.
@@ -374,11 +391,11 @@ public class RobotBrain : Agent
         grabCount   = 0;
         rApproach = rActionPen = rTimePen = rObstProx = rWallCol = rObstCol = rDirPen = rGrab = 0f;
 
-        // Базовый уровень потенциала. Обязательно ПОСЛЕ ResetBall и телепорта робота,
-        // иначе первый же шаг эпизода получит фиктивный скачок награды.
         // Камеру пересчитываем принудительно: её FixedUpdate в этом кадре ещё не был.
         if (cam != null) cam.Refresh();
-        prevPotential = CurrentPotential();
+        // Potential baseline is established at the first policy decision, not during reset.
+        prevPotential = 0f;
+        hasDecisionPotential = false;
 
         // Если мяч уже виден на старте — поиск не нужен, бонус за обнаружение не даём.
         // Если скрыт — everSeenBall станет true в тот момент, когда робот его найдёт.
@@ -643,10 +660,6 @@ public class RobotBrain : Agent
                 EndAttempt(RobotStats.Outcome.Success);
                 return;
             }
-            // Пока держим мяч, shaping не начисляется (мы вышли раньше ComputeRewards),
-            // но потенциал надо вести дальше: иначе после ReleaseBall() разница
-            // gamma*Ф(s') - Ф(s) посчитается от протухшего Ф и даст ложный скачок.
-            prevPotential = CurrentPotential();
             return;
         }
 
@@ -827,25 +840,48 @@ public class RobotBrain : Agent
         return phi;
     }
 
+    private void AddPotentialReward(float value)
+    {
+        AddReward(value);
+        rApproach += value;
+    }
+
+    private void OnAcademyPreStep(int academyStepCount)
+    {
+        if (decisionRequester == null || decisionRequester.DecisionPeriod <= 0)
+            return;
+
+        bool isDecisionStep = academyStepCount % decisionRequester.DecisionPeriod
+                            == decisionRequester.DecisionStep;
+        if (!isDecisionStep)
+            return;
+
+        float currentPotential = CurrentPotential();
+        if (!hasDecisionPotential)
+        {
+            prevPotential = currentPotential;
+            hasDecisionPotential = true;
+            return;
+        }
+
+        AddPotentialReward(shapingGamma * currentPotential - prevPotential);
+        prevPotential = currentPotential;
+    }
+
+    private void AddTerminalPotentialReward()
+    {
+        if (!hasDecisionPotential)
+            return;
+
+        // Terminal state has Phi = 0, so gamma * Phi(terminal) - Phi(previous) = -Phi(previous).
+        AddPotentialReward(-prevPotential);
+        hasDecisionPotential = false;
+    }
+
     // ---------- Шаг 4: награды ----------
     private void ComputeRewards(float gasCmd, float steerCmd, float camCmd)
     {
-        // 1. Potential-based shaping: r = gamma*Ф(s') - Ф(s).
-        //    Теорема Ng et al. (1999): такая добавка НЕ меняет оптимальную политику
-        //    и не создаёт «вечных двигателей» — сумма по любому циклу равна ~0.
-        //    Раньше здесь было два фармящихся источника:
-        //      * центрирование платило 0.01/тик, пока мяч виден -> выгодно было
-        //        стоять в кольце видимости все 20 с (1000 тиков * 0.01 = +10),
-        //        что БОЛЬШЕ, чем захват (5.0) с удержанием (1.0);
-        //      * вес сближения (0.5 + closeWeight) считался по НОВОЙ дистанции и падал
-        //        с расстоянием, поэтому цикл «подъехал-отъехал» давал плюс на ровном месте.
-        //    Оба исчезли: платит только фактический прогресс к мячу.
-        float phi = CurrentPotential();
-        float shapingReward = shapingGamma * phi - prevPotential;
-        AddReward(shapingReward);
-        rApproach += shapingReward;
-        prevPotential = phi;
-
+        // Potential-based shaping is added once per policy transition in OnAcademyPreStep().
         // 2. Штраф за резкость управления (Action Rate Penalty). Единый штраф на газ, руль
         //    И камеру — этого достаточно, отдельные штрафы за камеру/реверс газа были
         //    избыточны (дублировали этот же сигнал) и убраны для простоты.
@@ -992,6 +1028,8 @@ public class RobotBrain : Agent
     // затем зовём EndEpisode(). Три исхода: успех, падение, таймаут.
     private void EndAttempt(RobotStats.Outcome outcome)
     {
+        AddTerminalPotentialReward();
+
         if (stats != null)
         {
             var s = new RobotStats.EpisodeResult
