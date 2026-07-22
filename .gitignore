@@ -1,0 +1,73 @@
+# Unity cache
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+/[Mm]emoryCaptures/
+/[Rr]ecordings/
+
+# Builds
+/[Bb]uild/
+/[Bb]uilds/
+/Build_Linux/
+/Build_Linux_TrainFixed/
+Build_Linux*.zip
+*.exe
+*.app
+*.apk
+*.aab
+
+# ML-Agents results
+/results/
+
+# IDE generated
+/.vs/
+/.vscode/
+/.idea/
+*.csproj
+*.sln
+*.slnx
+*.suo
+*.user
+*.userprefs
+*.pidb
+*.booproj
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Crash and temporary files
+sysinfo.txt
+crashlytics-build.properties
+
+# Local AI assistant settings
+/.claude/
+
+# Secrets and local SSH files
+/Materials/.ssh/
+/Materials/ssh.zip
+*.pem
+*.key
+
+# Runtime logs and editor temp files
+*.log
+*.swp
+*.swo
+*.tmp
+*.backup
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Duplicate source archives
+/Materials/1 - День первый 13.07/Xiao-r GFS-X_1.zip

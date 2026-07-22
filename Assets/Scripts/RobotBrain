@@ -1,0 +1,224 @@
+using UnityEngine;
+using Unity.MLAgents;
+using Unity.MLAgents.Sensors;
+using Unity.MLAgents.Actuators;
+#if ENABLE_INPUT_SYSTEM
+using UnityEngine.InputSystem;
+#endif
+
+// Мозг робота GFS-X. Собирает 15 наблюдений, принимает 3 непрерывных
+// действия + 1 дискретное, передаёт их в TrackController/GripperController,
+// считает награды и решает, когда заканчивать эпизод.
+[RequireComponent(typeof(Rigidbody))]
+public class RobotBrain : Agent
+{
+    [Header("Ссылки на тело робота")]
+    [SerializeField] private TrackController   track;
+    [SerializeField] private GripperController gripper;
+    [SerializeField] private VirtualSensors    sensors;
+    [SerializeField] private SimulatedYoloCamera cam;
+    [SerializeField] private Transform         eye;   // объект-"глаз" (сервопривод камеры)
+
+    [Header("Сервопривод камеры")]
+    [SerializeField] private float camServoMaxAngle = 60f;  // предел поворота, градусы
+    [SerializeField] private float camServoSpeed     = 90f;  // скорость поворота, град/сек
+
+    [Header("Условия падения")]
+    [SerializeField] private float fallY = -1f; // ниже этой высоты Y считаем, что робот упал с арены
+
+    [Header("Веса наград (подбираются экспериментально)")]
+    [SerializeField] private float approachRewardScale  = 1.0f;   // за сближение с мячом
+    [SerializeField] private float centeringRewardScale = 0.01f;  // за разворот к мячу
+    [SerializeField] private float actionPenaltyScale   = 0.01f;  // штраф за резкость управления
+    [SerializeField] private float obstaclePenalty      = 0.01f;  // штраф за близость к стене (ИК)
+    [SerializeField] private float grabReward           = 5.0f;   // бонус за успешный захват
+    [SerializeField] private float fallPenalty          = -1.0f;  // штраф за падение с арены
+
+    private Rigidbody rb;
+    private Vector3   startPosition;
+    private Quaternion startRotation;
+
+    private float prevDistanceToBall;  // расстояние до мяча на предыдущем шаге (для Distance Delta)
+    private float prevGas, prevSteer;  // предыдущие команды (для штрафа за резкость)
+    private float camServoAngle;       // текущий угол сервопривода камеры, -max..+max
+
+    // ---------- Жизненный цикл Agent ----------
+
+    void Awake()
+    {
+        // Запоминаем стартовые позицию/поворот один раз, до первого OnEpisodeBegin
+        startPosition = transform.position;
+        startRotation = transform.rotation;
+    }
+
+    public override void Initialize()
+    {
+        rb = GetComponent<Rigidbody>();
+
+        // С этого момента TrackController и GripperController слушают агента, а не клавиатуру
+        if (track   != null) track.ExternalControl   = true;
+        if (gripper != null) gripper.ExternalControl = true;
+    }
+
+    public override void OnEpisodeBegin()
+    {
+        // Возвращаем робота на старт и гасим всю скорость
+        transform.position = startPosition;
+        transform.rotation = startRotation;
+        rb.linearVelocity  = Vector3.zero;
+        rb.angularVelocity = Vector3.zero;
+
+        // Если мяч был зажат с прошлого эпизода — отпускаем
+        if (gripper != null && gripper.IsHolding)
+            gripper.ReleaseBall();
+
+        // Сбрасываем камеру и все накопленные для наград значения
+        camServoAngle = 0f;
+        if (eye != null) eye.localRotation = Quaternion.identity;
+
+        prevGas   = 0f;
+        prevSteer = 0f;
+
+        prevDistanceToBall = (cam != null && cam.TargetBall != null)
+            ? Vector3.Distance(transform.position, cam.TargetBall.position)
+            : 0f;
+    }
+
+    // ---------- Шаг 3.1: наблюдения (ровно 15, порядок как в методичке) ----------
+    public override void CollectObservations(VectorSensor sensor)
+    {
+        // 1. Нормализованное расстояние с УЗ-дальномера (0 вплотную .. 1 чисто)
+        sensor.AddObservation(sensors != null ? sensors.Ultrasonic : 1f);
+        // 2. Левый ИК-датчик препятствий (0/1)
+        sensor.AddObservation(sensors != null ? sensors.LeftIR : 0f);
+        // 3. Правый ИК-датчик препятствий (0/1)
+        sensor.AddObservation(sensors != null ? sensors.RightIR : 0f);
+        // 4. ИК-датчик клешни (0/1)
+        sensor.AddObservation(sensors != null ? sensors.GripperIR : 0f);
+        // 5. Относительный горизонтальный угол до мяча по камере (0, если мяч не виден)
+        sensor.AddObservation(cam != null ? cam.HorizontalOffset : 0f);
+        // 6. Нормализованное расстояние до мяча по камере (1, если мяч не виден)
+        sensor.AddObservation(cam != null ? cam.NormalizedDistance : 1f);
+        // 7. Последнее известное направление на мяч (после утери из кадра)
+        sensor.AddObservation(cam != null ? cam.LastKnownOffset : 0f);
+        // 8. Флаг видимости мяча
+        sensor.AddObservation(cam != null && cam.BallVisible ? 1f : 0f);
+        // 9. Текущий поворот сервопривода камеры, нормализованный -1..1
+        sensor.AddObservation(camServoMaxAngle > 0f ? camServoAngle / camServoMaxAngle : 0f);
+        // 10. Статус захвата мяча клешнёй
+        sensor.AddObservation(gripper != null && gripper.IsHolding ? 1f : 0f);
+        // 11-12. Относительное смещение робота от точки старта (X, Z)
+        Vector3 delta = transform.position - startPosition;
+        sensor.AddObservation(delta.x);
+        sensor.AddObservation(delta.z);
+        // 13. Нормализованный угол направления взгляда робота (Heading)
+        //     Перёд робота — это transform.right (см. TrackController), поэтому
+        //     сравниваем его с мировой осью X и переводим -180..180 в -1..1
+        float heading = Vector3.SignedAngle(Vector3.right, transform.right, Vector3.up);
+        sensor.AddObservation(heading / 180f);
+        // 14. Текущая скорость движения робота от Rigidbody
+        sensor.AddObservation(track != null ? track.CurrentSpeed : 0f);
+        // 15. Время, прошедшее с момента последней детекции мяча (нормализуем делением на 5 сек)
+        float t = cam != null ? cam.TimeSinceLastSeen : 0f;
+        sensor.AddObservation(Mathf.Clamp01(t / 5f));
+    }
+
+    // ---------- Шаг 3.2: приём действий ----------
+    public override void OnActionReceived(ActionBuffers actions)
+    {
+        float gasCmd   = Mathf.Clamp(actions.ContinuousActions[0], -1f, 1f); // линейное движение
+        float steerCmd = Mathf.Clamp(actions.ContinuousActions[1], -1f, 1f); // угловое вращение
+        float camCmd   = Mathf.Clamp(actions.ContinuousActions[2], -1f, 1f); // поворот камеры
+        int   gripCmd  = actions.DiscreteActions[0];                        // 0 стоять,1 закрыть,2 открыть
+
+        if (track != null)
+            track.SetDriveCommand(gasCmd, steerCmd);
+
+        // Поворачиваем "глаз" камеры плавно, в пределах ±camServoMaxAngle
+        camServoAngle = Mathf.Clamp(
+            camServoAngle + camCmd * camServoSpeed * Time.fixedDeltaTime,
+            -camServoMaxAngle, camServoMaxAngle);
+        if (eye != null)
+            eye.localRotation = Quaternion.Euler(0f, camServoAngle, 0f);
+
+        if (gripper != null)
+        {
+            if (gripCmd == 1 && !gripper.IsHolding) gripper.Grab();
+            if (gripCmd == 2 &&  gripper.IsHolding) gripper.ReleaseBall();
+        }
+
+        ComputeRewards(gasCmd, steerCmd);
+    }
+
+    // ---------- Шаг 4: награды ----------
+    private void ComputeRewards(float gasCmd, float steerCmd)
+    {
+        // 1. Награда за сближение (Distance Delta): чем ближе к мячу, тем весомее шаг приближения
+        if (cam != null && cam.TargetBall != null)
+        {
+            float dist  = Vector3.Distance(transform.position, cam.TargetBall.position);
+            float delta = prevDistanceToBall - dist;              // >0, если приблизились
+            float closeWeight = 1f - Mathf.Clamp01(dist / 2f);    // вблизи мяча вес ближе к 1
+            AddReward(delta * approachRewardScale * (0.5f + closeWeight));
+            prevDistanceToBall = dist;
+
+            // 3. Бонус за центрирование: поощряем смотреть на мяч, а не просто быть рядом
+            if (cam.BallVisible)
+            {
+                float centering = 1f - Mathf.Abs(cam.HorizontalOffset); // 1 - смотрим точно на мяч
+                AddReward(centering * centeringRewardScale);
+            }
+        }
+
+        // 2. Штраф за резкость управления (Action Rate Penalty)
+        float actionRate = Mathf.Abs(gasCmd - prevGas) + Mathf.Abs(steerCmd - prevSteer);
+        AddReward(-actionRate * actionPenaltyScale);
+        prevGas   = gasCmd;
+        prevSteer = steerCmd;
+
+        // 4. Штраф за датчики расстояния: критическая близость к стене по ИК
+        if (sensors != null && (sensors.LeftIR > 0.5f || sensors.RightIR > 0.5f))
+            AddReward(-obstaclePenalty);
+
+        // 5. Терминальные условия
+        if (gripper != null && gripper.IsHolding)
+        {
+            AddReward(grabReward);
+            EndEpisode();
+            return;
+        }
+
+        if (transform.position.y < fallY)
+        {
+            AddReward(fallPenalty);
+            EndEpisode();
+        }
+    }
+
+    // ---------- Ручной режим для проверки без обученной модели ----------
+    public override void Heuristic(in ActionBuffers actionsOut)
+    {
+        var cont = actionsOut.ContinuousActions;
+        var disc = actionsOut.DiscreteActions;
+
+        float g = 0f, s = 0f;
+        int   grip = 0;
+
+#if ENABLE_INPUT_SYSTEM
+        var kb = Keyboard.current;
+        if (kb != null)
+        {
+            if (kb.wKey.isPressed || kb.upArrowKey.isPressed)   g += 1f;
+            if (kb.sKey.isPressed || kb.downArrowKey.isPressed) g -= 1f;
+            if (kb.dKey.isPressed || kb.rightArrowKey.isPressed) s += 1f;
+            if (kb.aKey.isPressed || kb.leftArrowKey.isPressed)  s -= 1f;
+            if (kb.qKey.wasPressedThisFrame) grip = 1; // Q — сжать клешню
+            if (kb.eKey.wasPressedThisFrame) grip = 2; // E — разжать клешню
+        }
+#endif
+        cont[0] = g;
+        cont[1] = s;
+        cont[2] = 0f; // камерой в ручном режиме пока не рулим
+        disc[0] = grip;
+    }
+}
