@@ -42,6 +42,8 @@ public class GripperController : MonoBehaviour
 
     private Rigidbody heldRb;
     private Collider  heldCol;
+    private RigidbodyInterpolation heldInterpolationBeforeGrab;
+    private bool hasHeldInterpolation;
 
     // Захвачен ли мяч сейчас — нужно RobotBrain для наблюдения №10 и наград
     public bool IsHolding => isHolding;
@@ -72,6 +74,26 @@ public class GripperController : MonoBehaviour
     // Публичная обёртка для RobotBrain: отпустить мяч
     public void ReleaseBall() => Release();
 
+    // Сброс между эпизодами не зависит от согласованности isHolding/heldRb.
+    // Точный episode baseline мяча сразу после этого восстанавливает RobotBrain.ResetBall().
+    public void ResetHoldingState()
+    {
+        if (heldRb != null)
+        {
+            heldRb.transform.SetParent(null, true);
+
+            if (heldCol != null)
+                heldCol.enabled = true;
+
+            heldRb.isKinematic = false;
+
+            if (hasHeldInterpolation)
+                heldRb.interpolation = heldInterpolationBeforeGrab;
+        }
+
+        ClearTransientState();
+    }
+
     private void TryGrab()
     {
         if (sensors == null || holdPoint == null) return;
@@ -80,15 +102,20 @@ public class GripperController : MonoBehaviour
         GameObject ball = sensors.LastSeenBall;
         if (ball == null) return;
 
-        heldRb  = ball.GetComponent<Rigidbody>();
-        heldCol = ball.GetComponent<Collider>();
-        if (heldRb == null || heldCol == null) return;
+        Rigidbody candidateRb = ball.GetComponent<Rigidbody>();
+        Collider candidateCol = ball.GetComponent<Collider>();
+        if (candidateRb == null || candidateCol == null) return;
+
+        heldRb = candidateRb;
+        heldCol = candidateCol;
+        heldInterpolationBeforeGrab = heldRb.interpolation;
+        hasHeldInterpolation = true;
 
         heldRb.isKinematic = true;
-		heldRb.interpolation = RigidbodyInterpolation.None;
+        heldRb.interpolation = RigidbodyInterpolation.None;
         heldCol.enabled = false;
 
-        ball.transform.SetParent(holdPoint);
+        ball.transform.SetParent(holdPoint, true);
         ball.transform.localPosition = Vector3.zero;
         ball.transform.localRotation = Quaternion.identity;
 
@@ -98,19 +125,41 @@ public class GripperController : MonoBehaviour
 
     private void Release()
     {
-        if (!isHolding || heldRb == null) return;
+        if (heldRb != null)
+        {
+            Rigidbody releasedRb = heldRb;
+            Collider releasedCol = heldCol;
 
-        heldRb.transform.SetParent(null);
-        heldCol.enabled = true;
-        heldRb.isKinematic = false;
+            releasedRb.transform.SetParent(null, true);
 
-        if (robotBody != null)
-            heldRb.linearVelocity = robotBody.linearVelocity;
+            if (releasedCol != null)
+                releasedCol.enabled = true;
 
-        heldRb  = null;
+            releasedRb.isKinematic = false;
+
+            if (hasHeldInterpolation)
+                releasedRb.interpolation = heldInterpolationBeforeGrab;
+
+            releasedRb.angularVelocity = robotBody != null
+                ? robotBody.angularVelocity
+                : Vector3.zero;
+
+            if (robotBody != null)
+                releasedRb.linearVelocity = robotBody.linearVelocity;
+
+            Debug.Log("Отпуск");
+        }
+
+        ClearTransientState();
+    }
+
+    private void ClearTransientState()
+    {
+        heldRb = null;
         heldCol = null;
+        heldInterpolationBeforeGrab = default;
+        hasHeldInterpolation = false;
         isHolding = false;
-        Debug.Log("Отпуск");
     }
 
     void OnGUI()

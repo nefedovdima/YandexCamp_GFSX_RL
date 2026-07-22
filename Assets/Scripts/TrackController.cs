@@ -72,6 +72,23 @@ public class TrackController : MonoBehaviour
         steer = Mathf.Clamp(steerCmd, -1f, 1f);
     }
 
+    // Полный сброс переходного состояния привода между эпизодами.
+    // Позиция и поворот Rigidbody принадлежат RobotBrain и здесь не меняются.
+    public void ResetMotionState()
+    {
+        gas = 0f;
+        steer = 0f;
+        pwmL = 0f;
+        pwmR = 0f;
+        currentLinearSpeed = 0f;
+
+        if (rb != null)
+        {
+            rb.linearVelocity = Vector3.zero;
+            rb.angularVelocity = Vector3.zero;
+        }
+    }
+
     private void ReadInput()
     {
         if (externalControl) return; // команды уже пришли через SetDriveCommand

@@ -39,6 +39,20 @@ public class VirtualSensors : MonoBehaviour
 
     void FixedUpdate()
     {
+        Refresh();
+    }
+
+    public void ResetCachedState()
+    {
+        Ultrasonic = 1f;
+        LeftIR = 0f;
+        RightIR = 0f;
+        GripperIR = 0f;
+        LastSeenBall = null;
+    }
+
+    public void Refresh()
+    {
         Ultrasonic = ReadUltrasonic();
         LeftIR     = ReadIR(leftIRPoint);
         RightIR    = ReadIR(rightIRPoint);
@@ -97,6 +111,7 @@ public class VirtualSensors : MonoBehaviour
 
     private float ReadGripperIR()
     {
+        LastSeenBall = null;
         if (gripperIRPoint == null) return 0f;
 
         bool found = false;
