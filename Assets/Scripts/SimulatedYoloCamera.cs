@@ -67,14 +67,25 @@ public class SimulatedYoloCamera : MonoBehaviour
 
     void FixedUpdate()
     {
-        UpdateDetection();
+        UpdateDetection(true);
         if (drawFov) DrawFov();
     }
 
     // Принудительный пересчёт детекции «прямо сейчас». Нужен RobotBrain'у в
     // OnEpisodeBegin: мяч и робот только что телепортированы, а FixedUpdate камеры
     // в этом кадре ещё не отработал, и BallVisible описывает прошлый эпизод.
-    public void Refresh() => UpdateDetection();
+    public void Refresh() => UpdateDetection(false);
+
+    // Полностью очищает память детектора между эпизодами. После синхронизации
+    // физики RobotBrain вызывает Refresh(), чтобы получить состояние новой геометрии.
+    public void ResetDetectionMemory()
+    {
+        BallVisible = false;
+        HorizontalOffset = 0f;
+        NormalizedDistance = 1f;
+        LastKnownOffset = 0f;
+        TimeSinceLastSeen = 0f;
+    }
 
     // Была бы видна цель, окажись она в точке worldPos ПРЯМО СЕЙЧАС (та же логика,
     // что в UpdateDetection). Нужен спавну мяча, чтобы гарантировать старт "за стеной" /
@@ -115,7 +126,7 @@ public class SimulatedYoloCamera : MonoBehaviour
         Debug.DrawLine(c2, c3, col); Debug.DrawLine(c3, c0, col);
     }
 
-    private void UpdateDetection()
+    private void UpdateDetection(bool advanceTime)
     {
         BallVisible        = false;
         HorizontalOffset   = 0f;
@@ -163,7 +174,7 @@ public class SimulatedYoloCamera : MonoBehaviour
             LastKnownOffset   = HorizontalOffset;
             TimeSinceLastSeen = 0f;
         }
-        else
+        else if (advanceTime)
         {
             TimeSinceLastSeen += Time.fixedDeltaTime;
         }
