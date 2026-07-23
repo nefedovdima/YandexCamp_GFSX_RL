@@ -12,7 +12,10 @@
 /[Bb]uilds/
 /Build_Linux/
 /Build_Linux_TrainFixed/
+/Build_Vast/
 Build_Linux*.zip
+/GFSX_Training_linux.tar.gz
+/GFSX_Training_linux.tar.gz.sha256
 *.exe
 *.app
 *.apk
