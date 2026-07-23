@@ -46,6 +46,7 @@ public class RobotBrain : Agent
 
     [Header("Domain Randomization (Практика 5)")]
     [SerializeField] private bool enableDomainRandomization = true; // мастер-выключатель всех шумов/задержек
+    private bool enableLayoutRandomization;
     [SerializeField] private bool randomizeArenaInPlay      = true; // рандомизировать поле/мяч и в визуальном/ручном запуске (--interact), когда тренер не подключён
     [SerializeField] private EnvironmentRandomizer environment;     // коробки/свет/трение/спавн мяча (опционально)
     [SerializeField] private float usNoise          = 0.05f;  // белый шум УЗ-дальномера, ±доля от нормализованного значения
@@ -289,10 +290,13 @@ public class RobotBrain : Agent
     // Рандомизация физики/сенсоров (масса, шум УЗ, задержки) — только на обучении.
     private bool ApplyDR => isTraining && enableDomainRandomization;
 
-    // Рандомизация САМОЙ АРЕНЫ и точки спавна мяча: на обучении — всегда, вне обучения
+    // Рандомизация САМОЙ АРЕНЫ и точки спавна мяча: на обучении — по отдельному флагу, вне обучения
     // (визуальный/ручной запуск, --interact) — если включён флаг randomizeArenaInPlay.
     private bool ApplyArenaRandomization
-        => (isTraining && enableDomainRandomization) || (!isTraining && randomizeArenaInPlay);
+        => (isTraining && enableLayoutRandomization) || (!isTraining && randomizeArenaInPlay);
+
+    private bool ApplyEnvironmentPhysicalRandomization
+        => ApplyDR || (!isTraining && randomizeArenaInPlay);
 
     // Читает параметр из config.yaml (environment_parameters). Если его там нет —
     // берётся значение из инспектора Unity (fallback). Ключи см. в environment_parameters.
@@ -340,6 +344,7 @@ public class RobotBrain : Agent
         if (environment != null)
         {
             environment.MaxSpawnRadius = P("ball_spawn_radius", environment.MaxSpawnRadius);
+            environment.BallWallMargin = P("ball_wall_margin", environment.BallWallMargin);
 
             // Число коробок-преград из yaml. box_count_max: 0 -> преград нет.
             int bmin = Mathf.RoundToInt(P("box_count_min", environment.ActiveBoxCount.x));
@@ -348,7 +353,15 @@ public class RobotBrain : Agent
         }
 
         // --- Domain Randomization: мастер-выключатель и ключевые амплитуды ---
-        enableDomainRandomization = P("dr_enabled", enableDomainRandomization ? 1f : 0f) > 0.5f;
+        float drFlag = P("dr_enabled", enableDomainRandomization ? 1f : 0f);
+        enableDomainRandomization = drFlag > 0.5f;
+
+        float layoutFlag = P("layout_randomization_enabled", -1f);
+        enableLayoutRandomization =
+            layoutFlag < 0f
+                ? enableDomainRandomization
+                : layoutFlag > 0.5f;
+
         usNoise         = P("us_noise",            usNoise);
         odomDrift       = P("odom_drift",          odomDrift);
         odomNoise       = P("odom_noise",          odomNoise);
@@ -404,8 +417,10 @@ public class RobotBrain : Agent
         // randomizeArenaInPlay (тогда поле рандомизируется и при --interact).
         if (environment != null)
         {
-            if (ApplyArenaRandomization) environment.Randomize();
-            else                         environment.RestoreDefaults();
+            environment.Randomize(
+                ApplyArenaRandomization,
+                ApplyEnvironmentPhysicalRandomization
+            );
         }
 
         // Сброс камеры в стартовую позу ДО ResetBall: спавн мяча проверяет видимость
