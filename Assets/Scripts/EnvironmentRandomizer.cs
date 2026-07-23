@@ -1,13 +1,7 @@
 using UnityEngine;
 
 // Рандомизация окружения (расширение Практики 5 под нашу арену).
-// Каждый эпизод обучения арена выглядит иначе: коробки стоят в новых местах
-// и под новыми углами, другое освещение, другое трение пола, мяч появляется
-// в случайной точке (в том числе за коробками). Всё это не даёт нейросети
-// "заучить" одну конкретную комнату и заставляет выучить общую стратегию поиска.
-//
-// Вызывается из RobotBrain.OnEpisodeBegin(): Randomize() при обучении,
-// RestoreDefaults() при инференсе.
+// Layout (коробки) и физические свойства (свет/трение) можно включать независимо.
 public class EnvironmentRandomizer : MonoBehaviour
 {
     [Header("Арена (прямоугольник по X/Z)")]
@@ -41,10 +35,15 @@ public class EnvironmentRandomizer : MonoBehaviour
     [SerializeField] private LayerMask obstacleMask;              // слой коробок/стен
     [SerializeField] private float ballRobotMinDistance = 0.5f;   // мяч не появляется вплотную к роботу
     [SerializeField] private float maxSpawnRadius       = 0f;     // 0 = вся арена; >0 = мяч не дальше R от робота (для curriculum)
+    private float ballWallMargin = -1f;                           // <0 = legacy wallMargin + ballRadius
 
     // Максимальный радиус спавна мяча вокруг робота. RobotBrain задаёт его из
     // config.yaml (ball_spawn_radius): на старте curriculum мяч рядом, потом дальше.
     public float MaxSpawnRadius { get => maxSpawnRadius; set => maxSpawnRadius = value; }
+
+    // Минимальное расстояние ЦЕНТРА мяча до внутренней границы арены.
+    // Отрицательное значение сохраняет прежний отступ wallMargin + ballRadius.
+    public float BallWallMargin { get => ballWallMargin; set => ballWallMargin = value; }
 
     // Сколько коробок-преград включать за эпизод (min, max). RobotBrain задаёт из
     // config.yaml (box_count_min/max): поставь (0,0) — преград не будет вовсе.
@@ -60,6 +59,7 @@ public class EnvironmentRandomizer : MonoBehaviour
     private Quaternion[] lightStartRot;
     private PhysicsMaterial floorMat;
     private float        floorStartFriction;
+    private bool         ballSpawnWarningIssued;
 
     void Awake()
     {
@@ -110,12 +110,35 @@ public class EnvironmentRandomizer : MonoBehaviour
 
     public void Randomize()
     {
-        RandomizeBoxes();
-        RandomizeLights();
-        RandomizeFriction();
+        Randomize(true, true);
+    }
+
+    public void Randomize(bool randomizeLayout, bool randomizePhysical)
+    {
+        ballSpawnWarningIssued = false;
+
+        if (randomizeLayout) RandomizeBoxes();
+        else                 RestoreBoxes();
+
+        if (randomizePhysical)
+        {
+            RandomizeLights();
+            RandomizeFriction();
+        }
+        else
+        {
+            RestorePhysicalDefaults();
+        }
     }
 
     public void RestoreDefaults()
+    {
+        ballSpawnWarningIssued = false;
+        RestoreBoxes();
+        RestorePhysicalDefaults();
+    }
+
+    private void RestoreBoxes()
     {
         if (boxes != null && boxStartPos != null)
             for (int i = 0; i < boxes.Length; i++)
@@ -124,7 +147,10 @@ public class EnvironmentRandomizer : MonoBehaviour
                 boxes[i].gameObject.SetActive(boxStartActive[i]);
                 boxes[i].SetPositionAndRotation(boxStartPos[i], boxStartRot[i]);
             }
+    }
 
+    private void RestorePhysicalDefaults()
+    {
         if (lights != null && lightStartIntensity != null)
             for (int i = 0; i < lights.Length; i++)
             {
@@ -149,39 +175,105 @@ public class EnvironmentRandomizer : MonoBehaviour
                                     System.Func<Vector3, bool> reject = null)
     {
         float checkRadius = ballRadius * 1.5f;
+        float centerWallMargin = EffectiveBallWallMargin(ballRadius);
         // Для скрытого спавна условие жёстче (нужна точка за преградой/вне кадра),
         // поэтому даём больше попыток, когда предикат задан.
         int attempts = reject != null ? 60 : 30;
 
         for (int attempt = 0; attempt < attempts; attempt++)
         {
-            Vector3 pos = RandomPointInArena(wallMargin + ballRadius);
+            Vector3 pos = RandomPointInArena(centerWallMargin);
             pos.y = ballY;
 
-            if (robot != null)
-            {
-                Vector3 flat = pos - robot.position;
-                flat.y = 0f;
-                if (flat.magnitude < ballRobotMinDistance) continue;
-                // Curriculum: на ранних уроках держим мяч ближе к роботу
-                if (maxSpawnRadius > 0f && flat.magnitude > maxSpawnRadius) continue;
-            }
-
-            // Не внутри коробки/стены (с небольшим запасом).
-            // ВАЖНО: пол тоже лежит на слое Obstacle, поэтому проверочную сферу
-            // приподнимаем так, чтобы она не касалась пола — иначе ЛЮБАЯ точка
-            // считается занятой и мяч навсегда остаётся на стартовой позиции.
-            Vector3 checkPos = pos;
-            checkPos.y = Mathf.Max(ballY, checkRadius + 0.02f);
-            if (Physics.CheckSphere(checkPos, checkRadius, obstacleMask,
-                                    QueryTriggerInteraction.Ignore)) continue;
-
-            // Внешний фильтр (напр. "точка видна с камеры" — отвергаем для скрытого спавна)
-            if (reject != null && reject(pos)) continue;
+            if (!IsBallSpawnValid(pos, checkRadius, reject)) continue;
 
             return pos;
         }
-        return null;
+
+        // Скрытый spawn имеет внешний reject-фильтр. Сначала даём RobotBrain повторить
+        // поиск без него; fallback нужен только после обычного исчерпания попыток.
+        if (reject != null) return null;
+
+        Vector3 fallback = FindBoundedBallFallback(ballRadius, ballY, checkRadius);
+        WarnBallSpawnFallback(centerWallMargin, fallback);
+        return fallback;
+    }
+
+    private bool IsBallSpawnValid(Vector3 pos, float checkRadius,
+                                  System.Func<Vector3, bool> reject)
+    {
+        if (robot != null)
+        {
+            Vector3 flat = pos - robot.position;
+            flat.y = 0f;
+            if (flat.magnitude < ballRobotMinDistance) return false;
+            // Curriculum: на ранних уроках держим мяч ближе к роботу.
+            if (maxSpawnRadius > 0f && flat.magnitude > maxSpawnRadius) return false;
+        }
+
+        // Пол тоже лежит на слое Obstacle, поэтому сферу поднимаем над ним.
+        Vector3 checkPos = pos;
+        checkPos.y = Mathf.Max(pos.y, checkRadius + 0.02f);
+        if (Physics.CheckSphere(checkPos, checkRadius, obstacleMask,
+                                QueryTriggerInteraction.Ignore)) return false;
+
+        return reject == null || !reject(pos);
+    }
+
+    private Vector3 FindBoundedBallFallback(float ballRadius, float ballY,
+                                            float checkRadius)
+    {
+        float margin = EffectiveBallWallMargin(ballRadius);
+        float halfX = Mathf.Max(0f, arenaSize.x * 0.5f - margin);
+        float halfZ = Mathf.Max(0f, arenaSize.y * 0.5f - margin);
+        float cx = arenaCenter.x + (arenaOrigin != null ? arenaOrigin.position.x : 0f);
+        float cz = arenaCenter.y + (arenaOrigin != null ? arenaOrigin.position.z : 0f);
+
+        // Детерминированная ограниченная сетка от центра наружу. Обычно она находит
+        // свободную точку; даже последний fallback остаётся внутри wall margin.
+        const int rings = 3;
+        for (int ring = 0; ring <= rings; ring++)
+        {
+            for (int x = -ring; x <= ring; x++)
+            {
+                for (int z = -ring; z <= ring; z++)
+                {
+                    if (ring > 0 && Mathf.Abs(x) != ring && Mathf.Abs(z) != ring) continue;
+
+                    float nx = rings > 0 ? x / (float)rings : 0f;
+                    float nz = rings > 0 ? z / (float)rings : 0f;
+                    Vector3 candidate = new Vector3(
+                        cx + nx * halfX * 0.9f,
+                        ballY,
+                        cz + nz * halfZ * 0.9f);
+
+                    if (IsBallSpawnValid(candidate, checkRadius, null))
+                        return candidate;
+                }
+            }
+        }
+
+        return new Vector3(cx, ballY, cz);
+    }
+
+    private float EffectiveBallWallMargin(float ballRadius)
+    {
+        if (ballWallMargin < 0f)
+            return wallMargin + ballRadius;
+
+        // Центр не должен ставить collider за стену даже при ошибочном слишком
+        // маленьком параметре.
+        return Mathf.Max(ballWallMargin, ballRadius);
+    }
+
+    private void WarnBallSpawnFallback(float centerWallMargin, Vector3 fallback)
+    {
+        if (ballSpawnWarningIssued) return;
+        ballSpawnWarningIssued = true;
+        Debug.LogWarning(
+            $"{name}: no random ball spawn was found; using bounded fallback " +
+            $"{fallback} with center wall margin {centerWallMargin:F3} m.",
+            this);
     }
 
     // Случайная точка спавна РОБОТА: внутри арены (отступ wallMargin — не в стене),

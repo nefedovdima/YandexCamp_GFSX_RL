@@ -13,8 +13,6 @@ using UnityEngine.InputSystem;
 [RequireComponent(typeof(Rigidbody))]
 public class RobotBrain : Agent
 {
-    private const int ObservationSize = 15;
-
     [Header("Ссылки на тело робота")]
     [SerializeField] private TrackController   track;
     [SerializeField] private GripperController gripper;
@@ -134,37 +132,21 @@ public class RobotBrain : Agent
     private Rigidbody  ballRb;
     private Collider   ballCol;
     private Vector3    ballStartPosition; // стартовая точка мяча на арене
-    private Transform  ballOriginalParent;
-    private Quaternion ballOriginalLocalRotation;
-    private Quaternion ballOriginalWorldRotation;
-    private bool ballOriginalColliderEnabled;
-    private bool ballOriginalIsKinematic;
-    private RigidbodyInterpolation ballOriginalInterpolation;
 
-    private float prevPotential;       // Ф(s) на предыдущей policy decision boundary
-    private bool  hasDecisionPotential;
-    private DecisionRequester decisionRequester;
+    private float prevPotential;       // Ф(s) на предыдущем шаге (potential-based shaping)
     private float prevGas, prevSteer, prevCam;  // предыдущие команды (для штрафа за резкость)
     private float camServoAngle;       // текущий угол сервопривода камеры, -max..+max
     private float episodeTimer;        // сколько секунд длится текущий эпизод
 
     // ---------- Состояние Domain Randomization ----------
     private bool  isTraining;                 // подключён ли внешний тренер (mlagents-learn)
+    private bool  enableLayoutRandomization;
     private float robotBaseMass;              // заводская масса робота (для восстановления при инференсе)
-    private float trackBaseMoveSpeed;
-    private float trackBaseTurnSpeed;
-    private float trackBaseMaxPwmStep;
     private float ballBaseMass;               // заводская масса мяча
     private Vector3 ballBaseScale;            // заводской масштаб мяча
     private int   burstDropoutRemaining;      // сколько тиков камера ещё "слепа" (YOLO Burst Dropout)
     private float prevYaw;                    // угол рыскания на прошлом тике (для оценки скорости поворота)
-    private float currentYawRateDeg;
     private float timeSinceBallSeen;          // свой таймер "давности" мяча с учётом dropout
-    private bool  effectiveBallVisible;
-    private float lastEffectiveOffset;
-    private readonly float[] observationSnapshot = new float[ObservationSize];
-    private bool observationSnapshotValid;
-    private bool pendingEmergencyReset;
     private readonly Queue<float[]> actionBuffer = new Queue<float[]>(); // FIFO-очередь задержки команд
     private int   currentActionLatency;       // задержка этого эпизода, тиков
     private int   holdTicks;                  // сколько тиков подряд мяч удерживается
@@ -221,18 +203,8 @@ public class RobotBrain : Agent
             ballRb  = ball.GetComponent<Rigidbody>();
             ballCol = ball.GetComponent<Collider>();
             ballStartPosition = ball.position;
-            ballOriginalParent = ball.parent;
-            ballOriginalLocalRotation = ball.localRotation;
-            ballOriginalWorldRotation = ball.rotation;
             ballBaseScale     = ball.localScale;
-            if (ballCol != null)
-                ballOriginalColliderEnabled = ballCol.enabled;
-            if (ballRb != null)
-            {
-                ballBaseMass = ballRb.mass;
-                ballOriginalIsKinematic = ballRb.isKinematic;
-                ballOriginalInterpolation = ballRb.interpolation;
-            }
+            if (ballRb != null) ballBaseMass = ballRb.mass;
         }
     }
 
@@ -240,12 +212,6 @@ public class RobotBrain : Agent
     {
         rb = GetComponent<Rigidbody>();
         robotBaseMass = rb.mass;
-        if (track != null)
-        {
-            trackBaseMoveSpeed = track.MoveSpeed;
-            trackBaseTurnSpeed = track.TurnSpeed;
-            trackBaseMaxPwmStep = track.MaxPwmStep;
-        }
         diagLogger = GetComponent<DiagnosticLogger>(); // опционально; если компонента нет - остаётся null, лог просто не пишется
 
         // Тренер подключён -> это обучение, включаем рандомизацию.
@@ -269,30 +235,18 @@ public class RobotBrain : Agent
             int obstacleLayer = LayerMask.NameToLayer("Obstacle");
             if (obstacleLayer >= 0) obstacleCollisionMask = 1 << obstacleLayer;
         }
-
-        decisionRequester = GetComponent<DecisionRequester>();
-        Debug.Assert(decisionRequester != null, "RobotBrain requires a DecisionRequester component.");
-
-        // Defensive unsubscribe keeps the subscription unique even if initialization is repeated.
-        Academy.Instance.AgentPreStep -= OnAcademyPreStep;
-        Academy.Instance.AgentPreStep += OnAcademyPreStep;
-    }
-
-    protected override void OnDisable()
-    {
-        if (Academy.IsInitialized)
-            Academy.Instance.AgentPreStep -= OnAcademyPreStep;
-
-        base.OnDisable();
     }
 
     // Рандомизация физики/сенсоров (масса, шум УЗ, задержки) — только на обучении.
     private bool ApplyDR => isTraining && enableDomainRandomization;
 
-    // Рандомизация САМОЙ АРЕНЫ и точки спавна мяча: на обучении — всегда, вне обучения
+    // Рандомизация САМОЙ АРЕНЫ и точки спавна мяча: на обучении — по отдельному флагу, вне обучения
     // (визуальный/ручной запуск, --interact) — если включён флаг randomizeArenaInPlay.
     private bool ApplyArenaRandomization
-        => (isTraining && enableDomainRandomization) || (!isTraining && randomizeArenaInPlay);
+        => (isTraining && enableLayoutRandomization) || (!isTraining && randomizeArenaInPlay);
+
+    private bool ApplyEnvironmentPhysicalRandomization
+        => ApplyDR || (!isTraining && randomizeArenaInPlay);
 
     // Читает параметр из config.yaml (environment_parameters). Если его там нет —
     // берётся значение из инспектора Unity (fallback). Ключи см. в environment_parameters.
@@ -340,6 +294,7 @@ public class RobotBrain : Agent
         if (environment != null)
         {
             environment.MaxSpawnRadius = P("ball_spawn_radius", environment.MaxSpawnRadius);
+            environment.BallWallMargin = P("ball_wall_margin", environment.BallWallMargin);
 
             // Число коробок-преград из yaml. box_count_max: 0 -> преград нет.
             int bmin = Mathf.RoundToInt(P("box_count_min", environment.ActiveBoxCount.x));
@@ -348,7 +303,15 @@ public class RobotBrain : Agent
         }
 
         // --- Domain Randomization: мастер-выключатель и ключевые амплитуды ---
-        enableDomainRandomization = P("dr_enabled", enableDomainRandomization ? 1f : 0f) > 0.5f;
+        float drFlag = P("dr_enabled", enableDomainRandomization ? 1f : 0f);
+        enableDomainRandomization = drFlag > 0.5f;
+
+        float layoutFlag = P("layout_randomization_enabled", -1f);
+        enableLayoutRandomization =
+            layoutFlag < 0f
+                ? enableDomainRandomization
+                : layoutFlag > 0.5f;
+
         usNoise         = P("us_noise",            usNoise);
         odomDrift       = P("odom_drift",          odomDrift);
         odomNoise       = P("odom_noise",          odomNoise);
@@ -363,13 +326,11 @@ public class RobotBrain : Agent
         // Подтягиваем настройки из config.yaml (веса наград, лимиты, разброс DR).
         // Первым делом — до ApplyDR и ResetBall, т.к. они читают эти значения.
         ApplyTunables();
-        pendingEmergencyReset = false;
-        observationSnapshotValid = false;
 
-        // Сначала безусловно очищаем transient-состояние захвата. Точный baseline
-        // мяча ниже восстанавливает RobotBrain.ResetBall().
-        if (gripper != null)
-            gripper.ResetHoldingState();
+        // ВАЖНО: сначала отпускаем мяч, и только потом телепортируем робота.
+        // Иначе мяч (дочерний объект HoldPoint) уедет на спавн вместе с роботом.
+        if (gripper != null && gripper.IsHolding)
+            gripper.ReleaseBall();
 
         // Спавн робота: случайная точка арены (вне стен/коробок) при обучении/интеракте,
         // иначе заводская точка. ВАЖНО: считаем ДО RandomizeBoxes() — тогда коробки сами
@@ -385,27 +346,22 @@ public class RobotBrain : Agent
                 spawnRot = Quaternion.Euler(0f, Random.Range(0f, 360f), 0f);
             }
         }
-        rb.position = spawnPos;
-        rb.rotation = spawnRot;
-        if (track != null)
-        {
-            track.ResetMotionState();
-        }
-        else
-        {
-            rb.linearVelocity = Vector3.zero;
-            rb.angularVelocity = Vector3.zero;
-        }
+        transform.position = spawnPos;
+        transform.rotation = spawnRot;
+        rb.linearVelocity  = Vector3.zero;
+        rb.angularVelocity = Vector3.zero;
         episodeStartPosition = spawnPos; // отсюда считаем одометрию (obs 11-12) ЭТОГО эпизода
 
         // Перестраиваем арену: коробки, свет, трение (до спавна мяча,
         // чтобы мяч не оказался внутри свежепоставленной коробки).
-        // На обучении — всегда; в визуальном/ручном запуске — если включён
-        // randomizeArenaInPlay (тогда поле рандомизируется и при --interact).
+        // Layout и физические параметры управляются независимо; при inference
+        // randomizeArenaInPlay сохраняет прежнее совместное поведение.
         if (environment != null)
         {
-            if (ApplyArenaRandomization) environment.Randomize();
-            else                         environment.RestoreDefaults();
+            environment.Randomize(
+                ApplyArenaRandomization,
+                ApplyEnvironmentPhysicalRandomization
+            );
         }
 
         // Сброс камеры в стартовую позу ДО ResetBall: спавн мяча проверяет видимость
@@ -414,70 +370,9 @@ public class RobotBrain : Agent
         camServoAngle = 0f;
         if (eye != null) eye.localRotation = eyeStartLocalRot;
 
-        // SampleBallSpawn/WouldSeeBallAt ниже выполняют physics queries и должны
-        // видеть уже телепортированного робота, новую позу камеры и новые коробки.
-        Physics.SyncTransforms();
-
         // Возвращаем мяч: при обучении — случайная точка арены (в т.ч. за коробками),
         // иначе — стартовая точка с небольшим сдвигом
         ResetBall();
-
-        // Камера и сенсоры должны видеть окончательную позицию/масштаб мяча.
-        Physics.SyncTransforms();
-
-        if (cam != null)
-        {
-            cam.ResetDetectionMemory();
-            cam.Refresh();
-        }
-
-        if (sensors != null)
-        {
-            sensors.ResetCachedState();
-            sensors.Refresh();
-        }
-
-        // ---------- Шаг 1 DR: физическая рандомизация ----------
-        // Каждый эпизод робот "другой": иная масса, иная динамика моторов.
-        if (ApplyDR)
-        {
-            rb.mass = Random.Range(drMassRange.x, drMassRange.y);
-
-            if (track != null)
-            {
-                track.MoveSpeed  = Random.Range(drMoveSpeedRange.x, drMoveSpeedRange.y);
-                track.TurnSpeed  = Random.Range(drTurnSpeedRange.x, drTurnSpeedRange.y);
-                track.MaxPwmStep = Random.Range(drPwmStepRange.x, drPwmStepRange.y);
-            }
-        }
-        else
-        {
-            rb.mass = robotBaseMass;
-            if (track != null)
-            {
-                track.MoveSpeed = trackBaseMoveSpeed;
-                track.TurnSpeed = trackBaseTurnSpeed;
-                track.MaxPwmStep = trackBaseMaxPwmStep;
-            }
-        }
-
-        // ---------- Шаг 3 DR: очередь задержки команд (Latency Queue) ----------
-        currentActionLatency = ApplyDR ? Random.Range(latencyMinSteps, latencyMaxSteps + 1) : 0;
-        actionBuffer.Clear();
-        for (int i = 0; i < currentActionLatency; i++)
-            actionBuffer.Enqueue(new float[] { 0f, 0f, 0f });
-
-        // Temporal/effective state сбрасываем после fresh camera/sensor readings,
-        // чтобы первый snapshot относился только к новой геометрии.
-        burstDropoutRemaining = 0;
-        currentYawRateDeg = 0f;
-        prevYaw = transform.eulerAngles.y;
-        timeSinceBallSeen = 0f;
-        effectiveBallVisible = cam != null && cam.BallVisible;
-        lastEffectiveOffset = effectiveBallVisible ? cam.HorizontalOffset : 0f;
-        odomScale = ApplyDR ? 1f + Random.Range(-odomScaleErr, odomScaleErr) : 1f;
-        odomDriftAccum = Vector2.zero;
-        odomHeadingDriftAccum = 0f;
 
         prevGas   = 0f;
         prevSteer = 0f;
@@ -494,15 +389,53 @@ public class RobotBrain : Agent
         grabCount   = 0;
         rApproach = rActionPen = rTimePen = rObstProx = rWallCol = rObstCol = rDirPen = rGrab = 0f;
 
-        // Potential baseline is established at the first policy decision, not during reset.
-        prevPotential = 0f;
-        hasDecisionPotential = false;
+        // Базовый уровень потенциала. Обязательно ПОСЛЕ ResetBall и телепорта робота,
+        // иначе первый же шаг эпизода получит фиктивный скачок награды.
+        // Камеру пересчитываем принудительно: её FixedUpdate в этом кадре ещё не был.
+        if (cam != null) cam.Refresh();
+        prevPotential = CurrentPotential();
 
         // Если мяч уже виден на старте — поиск не нужен, бонус за обнаружение не даём.
         // Если скрыт — everSeenBall станет true в тот момент, когда робот его найдёт.
         everSeenBall = cam != null && cam.BallVisible;
 
-        PrepareInitialObservationSnapshot();
+        // ---------- Шаг 1 DR: физическая рандомизация ----------
+        // Каждый эпизод робот "другой": иная масса, иная динамика моторов.
+        // Так политика учится не под один экземпляр робота, а под весь разброс
+        // реальных машин (просевший АКБ, разболтанный редуктор и т.д.).
+        if (ApplyDR)
+        {
+            rb.mass = Random.Range(drMassRange.x, drMassRange.y);   // базовый вес 2.5 кг ± разброс
+
+            if (track != null)
+            {
+                track.MoveSpeed  = Random.Range(drMoveSpeedRange.x, drMoveSpeedRange.y); // базовая 0.57 м/с ± ~40%
+                track.TurnSpeed  = Random.Range(drTurnSpeedRange.x, drTurnSpeedRange.y); // базовая 120 град/с
+                track.MaxPwmStep = Random.Range(drPwmStepRange.x,   drPwmStepRange.y);   // инерция разгона
+            }
+        }
+        else
+        {
+            rb.mass = robotBaseMass; // на инференсе возвращаем заводские параметры
+        }
+
+        // ---------- Шаг 3 DR: очередь задержки команд (Latency Queue) ----------
+        // Реальные команды идут через Wi-Fi/ROS с пингом 160-260 мс. Заполняем FIFO-буфер
+        // нулями ("команды ещё не дошли"), и робот будет исполнять приказы с опозданием.
+        currentActionLatency = ApplyDR ? Random.Range(latencyMinSteps, latencyMaxSteps + 1) : 0;
+        actionBuffer.Clear();
+        for (int i = 0; i < currentActionLatency; i++)
+            actionBuffer.Enqueue(new float[] { 0f, 0f, 0f });
+
+        // Сброс сенсорных шумов
+        burstDropoutRemaining = 0;
+        timeSinceBallSeen     = 0f;
+        prevYaw               = transform.eulerAngles.y;
+
+        // Сброс шума одометрии: новая масштабная ошибка на эпизод, дрейф с нуля
+        odomScale             = ApplyDR ? 1f + Random.Range(-odomScaleErr, odomScaleErr) : 1f;
+        odomDriftAccum        = Vector2.zero;
+        odomHeadingDriftAccum = 0f;
     }
 
     // Возвращает мяч на стартовую позицию и восстанавливает его физику
@@ -545,29 +478,26 @@ public class RobotBrain : Agent
             pos += new Vector3(j.x, 0f, j.y);
         }
 
-        ball.SetParent(ballOriginalParent, true);
+        ball.SetParent(null);
         ball.position = pos;
-        if (ballOriginalParent != null)
-            ball.localRotation = ballOriginalLocalRotation;
-        else
-            ball.rotation = ballOriginalWorldRotation;
+        ball.rotation = Quaternion.identity;
 
-        // Сначала точный baseline, затем DR поверх него.
-        ball.localScale = ballBaseScale;
-        if (ApplyDR)
-            ball.localScale = ballBaseScale * Random.Range(drBallScaleMul.x, drBallScaleMul.y);
+        // DR: каждый эпизод мяч немного другой — размер ±20%, масса x0.5..x2.
+        // Реальные мячи различаются, а YOLO выдаёт рамки разного размера.
+        ball.localScale = ApplyDR
+            ? ballBaseScale * Random.Range(drBallScaleMul.x, drBallScaleMul.y)
+            : ballBaseScale;
 
-        if (ballCol != null)
-            ballCol.enabled = ballOriginalColliderEnabled;
+        // Страховка: если захват прервался нештатно, физика мяча могла остаться выключенной
+        if (ballCol != null) ballCol.enabled = true;
         if (ballRb != null)
         {
-            ballRb.isKinematic = ballOriginalIsKinematic;
-            ballRb.interpolation = ballOriginalInterpolation;
-            ballRb.linearVelocity = Vector3.zero;
+            ballRb.isKinematic     = false;
+            ballRb.linearVelocity  = Vector3.zero;
             ballRb.angularVelocity = Vector3.zero;
-            ballRb.mass = ballBaseMass;
-            if (ApplyDR)
-                ballRb.mass = ballBaseMass * Random.Range(drBallMassMul.x, drBallMassMul.y);
+            ballRb.mass = ApplyDR
+                ? ballBaseMass * Random.Range(drBallMassMul.x, drBallMassMul.y)
+                : ballBaseMass;
         }
     }
 
@@ -576,40 +506,134 @@ public class RobotBrain : Agent
     // белый шум УЗ и пачечные потери кадров YOLO. На инференсе данные чистые.
     public override void CollectObservations(VectorSensor sensor)
     {
-        if (pendingEmergencyReset || !IsEnvironmentStateFinite()
-            || !observationSnapshotValid || !IsObservationSnapshotFinite())
+        // ---------- Защита от "взрыва" физики ----------
+        // Редкий, но неизбежный на масштабе многих миллионов шагов баг движка: при столкновении
+        // с малой (DR-рандомизированной) массой Rigidbody иногда улетает в Infinity/NaN.
+        // Испорченная позиция иначе протекает в наблюдения (обс. 11-13, 5-6 через дистанцию
+        // до мяча) -> Python роняет ВЕСЬ тренировочный процесс с "observations had Infinite
+        // values". Ловим на корню: если позиция робота или мяча не конечна - не считаем
+        // наблюдения из мусора, шлём нейтральный вектор и немедленно сбрасываем эпизод.
+        bool robotBroken = !IsFiniteVector(transform.position) || !IsFiniteVector(rb.linearVelocity)
+                         || !float.IsFinite(camServoAngle)
+                         || !float.IsFinite(odomDriftAccum.x) || !float.IsFinite(odomDriftAccum.y)
+                         || !float.IsFinite(odomHeadingDriftAccum);
+        bool ballBroken   = ball != null && !IsFiniteVector(ball.position);
+        if (robotBroken || ballBroken)
         {
-            pendingEmergencyReset = true;
-            for (int i = 0; i < ObservationSize; i++)
-                sensor.AddObservation(0f);
+            for (int i = 0; i < 15; i++) sensor.AddObservation(0f); // держим контракт Space Size = 15
+            Debug.LogWarning($"[RobotBrain] Обнаружена нефинитная позиция (robot={robotBroken}, ball={ballBroken}) - аварийный сброс эпизода.");
+            AddReward(fallPenalty);
+            EndAttempt(RobotStats.Outcome.Fall);
             return;
         }
 
-        for (int i = 0; i < ObservationSize; i++)
-            sensor.AddObservation(observationSnapshot[i]);
+        // 1. УЗ-дальномер (0 вплотную .. 1 чисто) + белый шум ±5%.
+        //    Реальный HC-SR04 "дрожит" на пару сантиметров из-за переотражений звука.
+        //    Шум учит сеть доверять тенденции сближения, а не конкретным миллиметрам.
+        float us = sensors != null ? sensors.Ultrasonic : 1f;
+        if (ApplyDR) us = Mathf.Clamp01(us + Random.Range(-usNoise, usNoise));
+        sensor.AddObservation(us);
+        // 2-3. Боковые ИК-датчики (0/1) + редкие ложные срабатывания/пропуски.
+        //      Реальные ИК-модули иногда "мигают" от помех и бликов — сеть не должна
+        //      паниковать от одиночного неверного бита.
+        float leftIR  = sensors != null ? sensors.LeftIR  : 0f;
+        float rightIR = sensors != null ? sensors.RightIR : 0f;
+        if (ApplyDR && Random.value < irFlipChance) leftIR  = 1f - leftIR;
+        if (ApplyDR && Random.value < irFlipChance) rightIR = 1f - rightIR;
+        sensor.AddObservation(leftIR);
+        sensor.AddObservation(rightIR);
+        // 4. ИК-датчик клешни (0/1) — оставляем чистым: он физически управляет захватом
+        sensor.AddObservation(sensors != null ? sensors.GripperIR : 0f);
+
+        // ---------- Шаг 2 DR: пачечные потери YOLO (Burst Dropout) ----------
+        // При быстром развороте картинка смазывается и YOLO теряет мяч на 0.1-0.3 с.
+        // Скорость поворота меряем по дельте угла (rb.angularVelocity у нас всегда ~0,
+        // т.к. робот вращается через MoveRotation).
+        float yaw = transform.eulerAngles.y;
+        float yawRateDeg = Mathf.Abs(Mathf.DeltaAngle(prevYaw, yaw)) / Time.fixedDeltaTime;
+        prevYaw = yaw;
+
+        if (burstDropoutRemaining > 0)
+        {
+            burstDropoutRemaining--;
+        }
+        else if (ApplyDR)
+        {
+            if (yawRateDeg > dropoutYawRate && Random.value < dropoutChance)
+            {
+                // Длинная слепота при резком развороте (смаз изображения)
+                burstDropoutRemaining = Random.Range(dropoutMinSteps, dropoutMaxSteps + 1);
+            }
+            else if (Random.value < baseDropoutChance)
+            {
+                // Короткие случайные потери: YOLO иногда просто мигает даже на месте
+                burstDropoutRemaining = Random.Range(3, 9);
+            }
+        }
+
+        // Эффективная видимость мяча = реальная видимость МИНУС симулированная слепота
+        bool ballVisible = cam != null && cam.BallVisible && burstDropoutRemaining == 0;
+
+        // Свой таймер давности детекции (таймер камеры не знает про dropout)
+        timeSinceBallSeen = ballVisible ? 0f : timeSinceBallSeen + Time.fixedDeltaTime;
+
+        // 5. Относительный горизонтальный угол до мяча ПО КАДРУ КАМЕРЫ (0, если мяч не виден).
+        //    Система отсчёта — текущий поворот камеры, а не корпуса: нужен, чтобы сеть
+        //    понимала, куда довернуть САМУ КАМЕРУ (сервопривод), а не корпус.
+        sensor.AddObservation(ballVisible ? cam.HorizontalOffset : 0f);
+        // 6. Нормализованное расстояние до мяча по камере (1, если мяч не виден)
+        sensor.AddObservation(ballVisible ? cam.NormalizedDistance : 1f);
+        // 7. Последнее известное направление на мяч (память после утери из кадра).
+        //    ОТКАТ: пробовали заменить на пересчитанный пеленг относительно корпуса
+        //    (camServoAngle + офсет), знак формулы подтверждён верным эмпирически,
+        //    но два прогона подряд (train24 resume и train25 с нуля) не дали
+        //    устойчивого прироста относительно этой, проверенной версии — откатили,
+        //    т.к. нужен гарантированный рабочий результат, а не теоретически более
+        //    правильная, но пока не окупившаяся правка.
+        sensor.AddObservation(cam != null ? cam.LastKnownOffset : 0f);
+        // 8. Флаг видимости мяча
+        sensor.AddObservation(ballVisible ? 1f : 0f);
+        // 9. Текущий поворот сервопривода камеры, нормализованный -1..1
+        sensor.AddObservation(camServoMaxAngle > 0f ? camServoAngle / camServoMaxAngle : 0f);
+        // 10. Статус захвата мяча клешнёй
+        sensor.AddObservation(gripper != null && gripper.IsHolding ? 1f : 0f);
+        // 11-12. Относительное смещение робота от точки старта (X, Z), нормализовано к ±3 м.
+        //     ЭТО ОДОМЕТРИЯ: у реального робота она неточная (энкодеры+IMU дрейфуют).
+        //     При обучении подмешиваем ошибку масштаба + накопительный дрейф + шум,
+        //     чтобы политика не привыкала к идеальным координатам симулятора.
+        Vector3 delta = transform.position - episodeStartPosition;
+        float odomX = delta.x, odomZ = delta.z;
+        // 13. Курс: перёд робота — transform.right, сравниваем с мировой осью X (-180..180).
+        float heading = Vector3.SignedAngle(Vector3.right, transform.right, Vector3.up);
+
+        if (ApplyDR)
+        {
+            // Накопительный дрейф (random walk): std растёт ~sqrt(t) — как у реальной одометрии.
+            float sdt = Mathf.Sqrt(Time.fixedDeltaTime);
+            odomDriftAccum.x       += RandGaussian() * odomDrift        * sdt;
+            odomDriftAccum.y       += RandGaussian() * odomDrift        * sdt;
+            odomHeadingDriftAccum  += RandGaussian() * odomHeadingDrift * sdt;
+
+            odomX   = delta.x * odomScale + odomDriftAccum.x + Random.Range(-odomNoise, odomNoise);
+            odomZ   = delta.z * odomScale + odomDriftAccum.y + Random.Range(-odomNoise, odomNoise);
+            heading = heading + odomHeadingDriftAccum + Random.Range(-odomNoise, odomNoise) * 30f;
+        }
+
+        // heading не проходил через Clamp (пробел) - теперь защищён так же, как одометрия.
+        // Оборачиваем -180..180 перед делением, а не полагаемся на голое /180f.
+        float headingWrapped = Mathf.DeltaAngle(0f, heading); // приводит к диапазону -180..180
+        sensor.AddObservation(Mathf.Clamp(odomX / 3f, -1f, 1f));
+        sensor.AddObservation(Mathf.Clamp(odomZ / 3f, -1f, 1f));
+        sensor.AddObservation(Mathf.Clamp(headingWrapped / 180f, -1f, 1f));
+        // 14. Текущая скорость движения робота, нормализована к максимуму ~0.5 м/с
+        sensor.AddObservation(Mathf.Clamp01((track != null ? track.CurrentSpeed : 0f) / 0.5f));
+        // 15. Время с последней детекции мяча, с учётом dropout (нормализуем к 5 сек)
+        sensor.AddObservation(Mathf.Clamp01(timeSinceBallSeen / 5f));
     }
 
     // ---------- Шаг 3.2: приём действий ----------
     public override void OnActionReceived(ActionBuffers actions)
     {
-        if (pendingEmergencyReset)
-        {
-            AddReward(fallPenalty);
-            EndAttempt(RobotStats.Outcome.Fall);
-            return;
-        }
-
-        // На non-decision steps CollectObservations не вызывается, поэтому
-        // проверяем физику напрямую перед любыми действиями и наградами.
-        if (!IsEnvironmentStateFinite())
-        {
-            pendingEmergencyReset = true;
-            Debug.LogWarning("[RobotBrain] Обнаружено нефинитное состояние — аварийный сброс эпизода.");
-            AddReward(fallPenalty);
-            EndAttempt(RobotStats.Outcome.Fall);
-            return;
-        }
-
         // Мяч в клешне: робот замирает и должен стабильно удержать его ~1 секунду.
         // Это ближе к реальности, чем мгновенный успех: на настоящем роботе мяч
         // нередко выскальзывает сразу после захвата.
@@ -634,6 +658,10 @@ public class RobotBrain : Agent
                 EndAttempt(RobotStats.Outcome.Success);
                 return;
             }
+            // Пока держим мяч, shaping не начисляется (мы вышли раньше ComputeRewards),
+            // но потенциал надо вести дальше: иначе после ReleaseBall() разница
+            // gamma*Ф(s') - Ф(s) посчитается от протухшего Ф и даст ложный скачок.
+            prevPotential = CurrentPotential();
             return;
         }
 
@@ -755,185 +783,6 @@ public class RobotBrain : Agent
     private static bool IsFiniteVector(Vector3 v)
         => float.IsFinite(v.x) && float.IsFinite(v.y) && float.IsFinite(v.z);
 
-    private static bool IsFiniteQuaternion(Quaternion q)
-        => float.IsFinite(q.x) && float.IsFinite(q.y)
-        && float.IsFinite(q.z) && float.IsFinite(q.w);
-
-    private bool IsEnvironmentStateFinite()
-    {
-        if (rb == null || !IsFiniteVector(transform.position)
-            || !IsFiniteQuaternion(transform.rotation)
-            || !IsFiniteVector(rb.linearVelocity)
-            || !IsFiniteVector(rb.angularVelocity)
-            || !float.IsFinite(camServoAngle)
-            || !float.IsFinite(prevYaw)
-            || !float.IsFinite(currentYawRateDeg)
-            || !float.IsFinite(timeSinceBallSeen)
-            || !float.IsFinite(lastEffectiveOffset)
-            || !float.IsFinite(odomScale)
-            || !float.IsFinite(odomDriftAccum.x)
-            || !float.IsFinite(odomDriftAccum.y)
-            || !float.IsFinite(odomHeadingDriftAccum))
-        {
-            return false;
-        }
-
-        if (ball != null && (!IsFiniteVector(ball.position)
-            || !IsFiniteQuaternion(ball.rotation)))
-        {
-            return false;
-        }
-
-        if (ballRb != null && (!IsFiniteVector(ballRb.linearVelocity)
-            || !IsFiniteVector(ballRb.angularVelocity)))
-        {
-            return false;
-        }
-
-        return true;
-    }
-
-    private bool IsObservationSnapshotFinite()
-    {
-        for (int i = 0; i < ObservationSize; i++)
-        {
-            if (!float.IsFinite(observationSnapshot[i]))
-                return false;
-        }
-
-        return true;
-    }
-
-    private void FillNeutralObservationSnapshot()
-    {
-        for (int i = 0; i < ObservationSize; i++)
-            observationSnapshot[i] = 0f;
-    }
-
-    private bool UpdateTemporalObservationState()
-    {
-        if (!IsEnvironmentStateFinite() || !float.IsFinite(Time.fixedDeltaTime)
-            || Time.fixedDeltaTime <= 0f)
-        {
-            return false;
-        }
-
-        float dt = Time.fixedDeltaTime;
-        float yaw = transform.eulerAngles.y;
-        currentYawRateDeg = Mathf.Abs(Mathf.DeltaAngle(prevYaw, yaw)) / dt;
-        prevYaw = yaw;
-
-        if (burstDropoutRemaining > 0)
-        {
-            burstDropoutRemaining--;
-        }
-        else if (ApplyDR)
-        {
-            if (currentYawRateDeg > dropoutYawRate && Random.value < dropoutChance)
-            {
-                burstDropoutRemaining = Random.Range(dropoutMinSteps, dropoutMaxSteps + 1);
-            }
-            else if (Random.value < baseDropoutChance)
-            {
-                burstDropoutRemaining = Random.Range(3, 9);
-            }
-        }
-
-        effectiveBallVisible = cam != null && cam.BallVisible
-                            && burstDropoutRemaining == 0;
-        if (effectiveBallVisible)
-        {
-            if (!float.IsFinite(cam.HorizontalOffset)
-                || !float.IsFinite(cam.NormalizedDistance))
-            {
-                return false;
-            }
-
-            lastEffectiveOffset = cam.HorizontalOffset;
-            timeSinceBallSeen = 0f;
-        }
-        else
-        {
-            timeSinceBallSeen += dt;
-        }
-
-        if (ApplyDR)
-        {
-            float sqrtDt = Mathf.Sqrt(dt);
-            odomDriftAccum.x += RandGaussian() * odomDrift * sqrtDt;
-            odomDriftAccum.y += RandGaussian() * odomDrift * sqrtDt;
-            odomHeadingDriftAccum += RandGaussian() * odomHeadingDrift * sqrtDt;
-        }
-
-        return IsEnvironmentStateFinite();
-    }
-
-    private void PrepareObservationSnapshot()
-        => PrepareObservationSnapshot(true);
-
-    private void PrepareInitialObservationSnapshot()
-        => PrepareObservationSnapshot(false);
-
-    private void PrepareObservationSnapshot(bool applyNoise)
-    {
-        if (!IsEnvironmentStateFinite())
-        {
-            FillNeutralObservationSnapshot();
-            observationSnapshotValid = false;
-            return;
-        }
-
-        float us = sensors != null ? sensors.Ultrasonic : 1f;
-        float leftIR = sensors != null ? sensors.LeftIR : 0f;
-        float rightIR = sensors != null ? sensors.RightIR : 0f;
-
-        if (applyNoise && ApplyDR)
-        {
-            us = Mathf.Clamp01(us + Random.Range(-usNoise, usNoise));
-            if (Random.value < irFlipChance) leftIR = 1f - leftIR;
-            if (Random.value < irFlipChance) rightIR = 1f - rightIR;
-        }
-
-        Vector3 delta = transform.position - episodeStartPosition;
-        float odomX = delta.x;
-        float odomZ = delta.z;
-        float heading = Vector3.SignedAngle(Vector3.right, transform.right, Vector3.up);
-
-        if (ApplyDR)
-        {
-            odomX = delta.x * odomScale + odomDriftAccum.x;
-            odomZ = delta.z * odomScale + odomDriftAccum.y;
-            heading += odomHeadingDriftAccum;
-
-            if (applyNoise)
-            {
-                odomX += Random.Range(-odomNoise, odomNoise);
-                odomZ += Random.Range(-odomNoise, odomNoise);
-                heading += Random.Range(-odomNoise, odomNoise) * 30f;
-            }
-        }
-
-        observationSnapshot[0] = us;
-        observationSnapshot[1] = leftIR;
-        observationSnapshot[2] = rightIR;
-        observationSnapshot[3] = sensors != null ? sensors.GripperIR : 0f;
-        observationSnapshot[4] = effectiveBallVisible ? cam.HorizontalOffset : 0f;
-        observationSnapshot[5] = effectiveBallVisible ? cam.NormalizedDistance : 1f;
-        observationSnapshot[6] = lastEffectiveOffset;
-        observationSnapshot[7] = effectiveBallVisible ? 1f : 0f;
-        observationSnapshot[8] = camServoMaxAngle > 0f ? camServoAngle / camServoMaxAngle : 0f;
-        observationSnapshot[9] = gripper != null && gripper.IsHolding ? 1f : 0f;
-        observationSnapshot[10] = Mathf.Clamp(odomX / 3f, -1f, 1f);
-        observationSnapshot[11] = Mathf.Clamp(odomZ / 3f, -1f, 1f);
-        observationSnapshot[12] = Mathf.Clamp(Mathf.DeltaAngle(0f, heading) / 180f, -1f, 1f);
-        observationSnapshot[13] = Mathf.Clamp01((track != null ? track.CurrentSpeed : 0f) / 0.5f);
-        observationSnapshot[14] = Mathf.Clamp01(timeSinceBallSeen / 5f);
-
-        observationSnapshotValid = IsObservationSnapshotFinite();
-        if (!observationSnapshotValid)
-            FillNeutralObservationSnapshot();
-    }
-
     // Санитизация действия от сети. ВАЖНО: Mathf.Clamp НЕ фильтрует NaN — сравнения
     // с NaN всегда ложны, поэтому Mathf.Clamp(NaN, -1, 1) возвращает NaN как есть.
     // Если сеть хоть раз отдаст NaN-действие (редкий численный сбой, напр. сразу
@@ -993,57 +842,54 @@ public class RobotBrain : Agent
         return phi;
     }
 
-    private void AddPotentialReward(float value)
+// Начисляет potential shaping ровно один раз на переход между решениями policy.
+// Вызывается RewardDecisionRequester непосредственно перед RequestDecision(),
+// пока накопленная награда ещё относится к предыдущему действию.
+public void FinalizeDecisionPotentialReward(bool terminal = false)
+{
+    if (terminal)
     {
-        AddReward(value);
-        rApproach += value;
+        // Потенциал терминального состояния принимается равным нулю:
+        // F(s, terminal) = gamma * 0 - Phi(s).
+        float terminalShapingReward = -prevPotential;
+
+        AddReward(terminalShapingReward);
+        rApproach += terminalShapingReward;
+
+        prevPotential = 0f;
+        return;
     }
 
-    private void OnAcademyPreStep(int academyStepCount)
-    {
-        bool temporalValid = UpdateTemporalObservationState();
-        PrepareObservationSnapshot();
+    float currentPotential = CurrentPotential();
+    float shapingReward = shapingGamma * currentPotential - prevPotential;
 
-        if (!temporalValid || !observationSnapshotValid)
-        {
-            pendingEmergencyReset = true;
-            return;
-        }
+    AddReward(shapingReward);
+    rApproach += shapingReward;
 
-        if (decisionRequester == null || decisionRequester.DecisionPeriod <= 0)
-            return;
+    prevPotential = currentPotential;
+}
 
-        bool isDecisionStep = academyStepCount % decisionRequester.DecisionPeriod
-                            == decisionRequester.DecisionStep;
-        if (!isDecisionStep)
-            return;
 
-        float currentPotential = CurrentPotential();
-        if (!hasDecisionPotential)
-        {
-            prevPotential = currentPotential;
-            hasDecisionPotential = true;
-            return;
-        }
-
-        AddPotentialReward(shapingGamma * currentPotential - prevPotential);
-        prevPotential = currentPotential;
-    }
-
-    private void AddTerminalPotentialReward()
-    {
-        if (!hasDecisionPotential)
-            return;
-
-        // Terminal state has Phi = 0, so gamma * Phi(terminal) - Phi(previous) = -Phi(previous).
-        AddPotentialReward(-prevPotential);
-        hasDecisionPotential = false;
-    }
 
     // ---------- Шаг 4: награды ----------
     private void ComputeRewards(float gasCmd, float steerCmd, float camCmd)
     {
-        // Potential-based shaping is added once per policy transition in OnAcademyPreStep().
+        // 1. Potential-based shaping: r = gamma*Ф(s') - Ф(s).
+        //    Теорема Ng et al. (1999): такая добавка НЕ меняет оптимальную политику
+        //    и не создаёт «вечных двигателей» — сумма по любому циклу равна ~0.
+        //    Раньше здесь было два фармящихся источника:
+        //      * центрирование платило 0.01/тик, пока мяч виден -> выгодно было
+        //        стоять в кольце видимости все 20 с (1000 тиков * 0.01 = +10),
+        //        что БОЛЬШЕ, чем захват (5.0) с удержанием (1.0);
+        //      * вес сближения (0.5 + closeWeight) считался по НОВОЙ дистанции и падал
+        //        с расстоянием, поэтому цикл «подъехал-отъехал» давал плюс на ровном месте.
+        //    Оба исчезли: платит только фактический прогресс к мячу.
+        float phi = CurrentPotential();
+        float shapingReward = shapingGamma * phi - prevPotential;
+        AddReward(shapingReward);
+        rApproach += shapingReward;
+        prevPotential = phi;
+
         // 2. Штраф за резкость управления (Action Rate Penalty). Единый штраф на газ, руль
         //    И камеру — этого достаточно, отдельные штрафы за камеру/реверс газа были
         //    избыточны (дублировали этот же сигнал) и убраны для простоты.
@@ -1190,8 +1036,6 @@ public class RobotBrain : Agent
     // затем зовём EndEpisode(). Три исхода: успех, падение, таймаут.
     private void EndAttempt(RobotStats.Outcome outcome)
     {
-        AddTerminalPotentialReward();
-
         if (stats != null)
         {
             var s = new RobotStats.EpisodeResult
